@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
 
 from data import config
 from data.loader import load_and_prepare, net_pressure
+from utils.eda import build_insight_bullets, correlation_matrix, summary_statistics
 from model.forecasting import (
     ModelName,
     decomposition_plotly_df,
@@ -147,9 +148,80 @@ def main():
 
     df = get_prepared_data(csv_path)
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["Forecasts", "Model comparison", "Decomposition & flow", "Evaluation & KPIs"]
+    tab0, tab1, tab2, tab3, tab4 = st.tabs(
+        [
+            "EDA & insights",
+            "Forecasts",
+            "Model comparison",
+            "Decomposition & flow",
+            "Evaluation & KPIs",
+        ]
     )
+
+    with tab0:
+        st.subheader("Exploratory data analysis (live)")
+        st.caption("Statistics and charts update from the dataset selected in the sidebar.")
+
+        cols_num = [
+            c
+            for c in [
+                config.HHS_CARE,
+                config.TRANSFERS,
+                config.DISCHARGED,
+                config.CBP_CUSTODY,
+                config.APPREHENDED,
+            ]
+            if c in df.columns
+        ]
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Observations (days)", f"{len(df):,}")
+        m2.metric("Start date", str(df.index.min().date()))
+        m3.metric("End date", str(df.index.max().date()))
+
+        st.markdown("#### Summary statistics")
+        st.dataframe(summary_statistics(df), use_container_width=True)
+
+        st.markdown("#### Key series (standardized for comparison)")
+        zdf = pd.DataFrame(index=df.index)
+        for c in cols_num:
+            s = df[c].astype(float)
+            std = float(s.std()) or 1.0
+            zdf[c[:22] + "…" if len(c) > 22 else c] = (s - s.mean()) / std
+        figz = go.Figure()
+        for c in zdf.columns:
+            figz.add_trace(go.Scatter(x=zdf.index, y=zdf[c], name=c, mode="lines", opacity=0.85))
+        figz.update_layout(
+            height=400,
+            hovermode="x unified",
+            yaxis_title="Z-score",
+            legend=dict(orientation="h", y=1.12, x=0),
+            margin=dict(t=48),
+        )
+        st.plotly_chart(figz, use_container_width=True)
+
+        st.markdown("#### Correlation matrix (numeric program columns)")
+        cm = correlation_matrix(df)
+        if not cm.empty:
+            fig_h = go.Figure(
+                data=go.Heatmap(
+                    z=cm.values,
+                    x=[x[:18] + "…" if len(x) > 18 else x for x in cm.columns],
+                    y=[y[:18] + "…" if len(y) > 18 else y for y in cm.index],
+                    colorscale="RdBu",
+                    zmin=-1,
+                    zmax=1,
+                    colorbar=dict(title="r"),
+                )
+            )
+            fig_h.update_layout(height=420, yaxis=dict(autorange="reversed"))
+            st.plotly_chart(fig_h, use_container_width=True)
+        else:
+            st.info("Not enough numeric columns for a correlation matrix.")
+
+        st.markdown("#### Automated insights (from current data)")
+        for b in build_insight_bullets(df):
+            st.markdown(f"- {b}")
 
     with tab1:
         col1, col2 = st.columns(2)
