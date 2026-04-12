@@ -5,6 +5,7 @@ Run: streamlit run app.py
 
 from __future__ import annotations
 
+import hashlib
 import sys
 from pathlib import Path
 
@@ -43,13 +44,15 @@ MODEL_LABELS: dict[str, str] = {
 
 
 @st.cache_data(show_spinner=False)
-def get_prepared_data(csv_path: str) -> pd.DataFrame:
+def get_prepared_data(csv_path: str, data_fingerprint: str) -> pd.DataFrame:
+    """`data_fingerprint` must change when the file contents change (upload or disk edit)."""
+    _ = data_fingerprint
     return load_and_prepare(csv_path, interpolate=True)
 
 
 @st.cache_data(show_spinner=False)
-def cached_walk_forward(path: str, target: str, model: str) -> dict:
-    df = get_prepared_data(path)
+def cached_walk_forward(path: str, target: str, model: str, data_fingerprint: str) -> dict:
+    df = get_prepared_data(path, data_fingerprint)
     return walk_forward_scores(df, target, model, min_train=min(400, max(100, len(df) // 2)))
 
 
@@ -110,15 +113,32 @@ def main():
         "and approximate uncertainty bands where available."
     )
 
+    using_upload = False
+    upload_display_name: str | None = None
+    data_fingerprint = ""
+
     with st.sidebar:
         st.header("Data")
         upload = st.file_uploader("CSV (optional)", type=["csv"])
         if upload is not None:
+            raw = upload.getvalue()
             up_path = ROOT / "_streamlit_upload.csv"
-            up_path.write_bytes(upload.getvalue())
+            up_path.write_bytes(raw)
             csv_path = str(up_path)
+            using_upload = True
+            upload_display_name = upload.name
+            data_fingerprint = f"upload:{hashlib.sha256(raw).hexdigest()}"
+            st.success("Uploaded file is active", icon="✅")
+            st.caption(f"**{upload.name}** · {len(raw):,} bytes saved")
         else:
             csv_path = str(CSV_DEFAULT)
+            p = Path(csv_path)
+            if p.exists():
+                data_fingerprint = f"default:{p.stat().st_mtime_ns}:{p.stat().st_size}"
+            else:
+                data_fingerprint = "default:missing"
+            st.info("Using default project CSV", icon="📁")
+            st.caption(f"`{CSV_DEFAULT.name}`")
         if not Path(csv_path).exists():
             st.error(f"CSV not found: {csv_path}")
             st.stop()
@@ -146,7 +166,23 @@ def main():
             format_func=lambda k: MODEL_LABELS[k],
         )
 
-    df = get_prepared_data(csv_path)
+    df = get_prepared_data(csv_path, data_fingerprint)
+
+    st.divider()
+    ind1, ind2, ind3, ind4 = st.columns(4)
+    if using_upload:
+        ind1.markdown(":green[**Data source**]  \nUploaded CSV")
+        ind2.markdown(f"**File**  \n`{upload_display_name}`")
+    else:
+        ind1.markdown(":blue[**Data source**]  \nBundled default")
+        ind2.markdown(f"**File**  \n`{CSV_DEFAULT.name}`")
+    ind3.metric("Rows loaded", f"{len(df):,}")
+    ind4.metric("Date span", f"{df.index.min().date()} → {df.index.max().date()}")
+    st.caption(
+        "Charts and models below use this dataset. Change the upload or replace the default CSV on disk, "
+        "then the app refreshes automatically."
+    )
+    st.divider()
 
     tab0, tab1, tab2, tab3, tab4 = st.tabs(
         [
@@ -382,7 +418,7 @@ def main():
             format_func=lambda k: MODEL_LABELS[k],
             key="eval_m",
         )
-        wf = cached_walk_forward(csv_path, config.HHS_CARE, eval_model)
+        wf = cached_walk_forward(csv_path, config.HHS_CARE, eval_model, data_fingerprint)
         rows = []
         for h, m in sorted(wf.items()):
             rows.append(
