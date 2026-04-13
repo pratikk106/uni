@@ -1,8 +1,8 @@
 # Predictive Forecasting of Care Load and Placement Demand  
 ## Unaccompanied Children (UAC) Program — Daily Operational Data
 
-**Author:** [Your Name]  
-**Affiliation:** [University / Course]  
+**Author:** Pratik Kamble  
+**Affiliation:**   
 **Date:** April 2026  
 
 ---
