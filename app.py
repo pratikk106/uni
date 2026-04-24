@@ -5,7 +5,6 @@ Run: streamlit run app.py
 
 from __future__ import annotations
 
-import hashlib
 import sys
 from pathlib import Path
 
@@ -20,40 +19,46 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from data import config
-from data.loader import load_and_prepare, net_pressure
+from data.loader import load_and_prepare, load_raw_csv, net_pressure
 from utils.eda import build_insight_bullets, correlation_matrix, summary_statistics
 from model.forecasting import (
     ModelName,
     decomposition_plotly_df,
-    kpi_bundle,
     run_model_forecast,
     train_ml_model,
     walk_forward_scores,
 )
 
-CSV_DEFAULT = ROOT / "HHS_Unaccompanied_Alien_Children_Program.csv"
+CSV_DEFAULT_NAME = "HHS_Unaccompanied_Alien_Children_Program (1).csv"
+CSV_DEFAULT_LOCATIONS = [ROOT, ROOT.parent, ROOT.parent.parent]
+
+
+def resolve_default_csv() -> Path:
+    for folder in CSV_DEFAULT_LOCATIONS:
+        candidate = folder / CSV_DEFAULT_NAME
+        if candidate.exists():
+            return candidate
+    return ROOT / CSV_DEFAULT_NAME
+
+
+CSV_DEFAULT = resolve_default_csv()
 
 MODEL_LABELS: dict[str, str] = {
     "naive": "Naïve (last value)",
     "ma_7": "Moving average (7d)",
     "sarima": "SARIMA (weekly seasonality)",
     "ets": "Exponential smoothing (Holt–Winters)",
-    "random_forest": "Random Forest",
-    "gradient_boosting": "Gradient Boosting",
 }
 
 
 @st.cache_data(show_spinner=False)
-def get_prepared_data(csv_path: str, data_fingerprint: str) -> pd.DataFrame:
+def get_prepared_data(csv_path: str, data_fingerprint: str, prep_mode: str) -> pd.DataFrame:
     """`data_fingerprint` must change when the file contents change (upload or disk edit)."""
     _ = data_fingerprint
-    return load_and_prepare(csv_path, interpolate=True)
-
-
-@st.cache_data(show_spinner=False)
-def cached_walk_forward(path: str, target: str, model: str, data_fingerprint: str) -> dict:
-    df = get_prepared_data(path, data_fingerprint)
-    return walk_forward_scores(df, target, model, min_train=min(400, max(100, len(df) // 2)))
+    if prep_mode == "Continuous daily + interpolation":
+        return load_and_prepare(csv_path, interpolate=True)
+    # Default: use only cleaned raw-valid rows.
+    return load_raw_csv(csv_path)
 
 
 def fig_forecast(
@@ -105,6 +110,12 @@ def fig_forecast(
     return fig
 
 
+@st.cache_data(show_spinner=False)
+def cached_model_scores(path: str, target: str, model: str, data_fingerprint: str) -> dict:
+    df = get_prepared_data(path, data_fingerprint, prep_mode="Raw valid rows (no interpolation)")
+    return walk_forward_scores(df, target, model, min_train=min(300, max(120, len(df) // 2)))
+
+
 def main():
     st.set_page_config(page_title="UAC Care Load Forecasting", layout="wide")
     st.title("Predictive forecasting: care load & placement demand")
@@ -113,45 +124,31 @@ def main():
         "and approximate uncertainty bands where available."
     )
 
-    using_upload = False
-    upload_display_name: str | None = None
-    data_fingerprint = ""
+    csv_path = str(CSV_DEFAULT)
+    p = Path(csv_path)
+    if p.exists():
+        data_fingerprint = f"default:{p.stat().st_mtime_ns}:{p.stat().st_size}"
+    else:
+        data_fingerprint = "default:missing"
 
     with st.sidebar:
         st.header("Data")
-        upload = st.file_uploader("CSV (optional)", type=["csv"])
-        if upload is not None:
-            raw = upload.getvalue()
-            up_path = ROOT / "_streamlit_upload.csv"
-            up_path.write_bytes(raw)
-            csv_path = str(up_path)
-            using_upload = True
-            upload_display_name = upload.name
-            data_fingerprint = f"upload:{hashlib.sha256(raw).hexdigest()}"
-            st.success("Uploaded file is active", icon="✅")
-            st.caption(f"**{upload.name}** · {len(raw):,} bytes saved")
-        else:
-            csv_path = str(CSV_DEFAULT)
-            p = Path(csv_path)
-            if p.exists():
-                data_fingerprint = f"default:{p.stat().st_mtime_ns}:{p.stat().st_size}"
-            else:
-                data_fingerprint = "default:missing"
-            st.info("Using default project CSV", icon="📁")
-            st.caption(f"`{CSV_DEFAULT.name}`")
+        st.info("Using fixed project CSV", icon="📁")
+        st.caption(f"`{CSV_DEFAULT.name}`")
         if not Path(csv_path).exists():
             st.error(f"CSV not found: {csv_path}")
             st.stop()
 
+        st.header("Methodology mode")
+        prep_mode = st.selectbox(
+            "Time-series preparation",
+            ["Raw valid rows (no interpolation)", "Continuous daily + interpolation"],
+            index=0,
+            help="Raw valid rows uses only cleaned dated rows. Continuous daily expands missing dates and interpolates values.",
+        )
+
         st.header("Controls")
         horizon = st.slider("Forecast horizon (days)", 1, 42, 14)
-        breach_level = st.number_input(
-            "Capacity stress threshold (HHS care count)",
-            min_value=0,
-            value=int(2600),
-            step=50,
-            help="Used for breach probability KPI.",
-        )
         st.subheader("Models for scenario comparison")
         compare_a: ModelName = st.selectbox(
             "Scenario A",
@@ -162,35 +159,45 @@ def main():
         compare_b: ModelName = st.selectbox(
             "Scenario B",
             list(MODEL_LABELS.keys()),
-            index=5,
+            index=3,
             format_func=lambda k: MODEL_LABELS[k],
         )
 
-    df = get_prepared_data(csv_path, data_fingerprint)
+    # Data coverage counters for transparent preprocessing diagnostics.
+    try:
+        raw_csv_rows = int(len(pd.read_csv(csv_path)))
+    except Exception:
+        raw_csv_rows = 0
+    try:
+        valid_dated_rows = int(len(load_raw_csv(csv_path)))
+    except Exception:
+        valid_dated_rows = 0
+    df = get_prepared_data(csv_path, data_fingerprint, prep_mode)
+    modeled_days = int(len(df))
 
     st.divider()
     ind1, ind2, ind3, ind4 = st.columns(4)
-    if using_upload:
-        ind1.markdown(":green[**Data source**]  \nUploaded CSV")
-        ind2.markdown(f"**File**  \n`{upload_display_name}`")
-    else:
-        ind1.markdown(":blue[**Data source**]  \nBundled default")
-        ind2.markdown(f"**File**  \n`{CSV_DEFAULT.name}`")
-    ind3.metric("Rows loaded", f"{len(df):,}")
+    ind1.markdown(":blue[**Data source**]  \nFixed dataset")
+    ind2.markdown(f"**File**  \n`{CSV_DEFAULT.name}`")
+    ind3.metric("Rows loaded", f"{modeled_days:,}")
     ind4.metric("Date span", f"{df.index.min().date()} → {df.index.max().date()}")
-    st.caption(
-        "Charts and models below use this dataset. Change the upload or replace the default CSV on disk, "
-        "then the app refreshes automatically."
-    )
+    st.caption("Charts and models below use this fixed dataset file and the selected methodology mode.")
+    st.markdown("#### Data pipeline counts")
+    c1, c2 = st.columns(2)
+    c1.metric("Valid dated rows", f"{valid_dated_rows:,}")
+    c2.metric("Final modeling rows", f"{modeled_days:,}")
+    st.caption(f"Active preparation mode: `{prep_mode}`")
     st.divider()
 
-    tab0, tab1, tab2, tab3, tab4 = st.tabs(
+    tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
         [
             "EDA & insights",
             "Forecasts",
             "Model comparison",
             "Decomposition & flow",
-            "Evaluation & KPIs",
+            "Early warnings",
+            "ML vs statistical",
+            "Methodology mode",
         ]
     )
 
@@ -211,7 +218,7 @@ def main():
         ]
 
         m1, m2, m3 = st.columns(3)
-        m1.metric("Observations (days)", f"{len(df):,}")
+        m1.metric("Observations (rows)", f"{len(df):,}")
         m2.metric("Start date", str(df.index.min().date()))
         m3.metric("End date", str(df.index.max().date()))
 
@@ -280,18 +287,11 @@ def main():
                 key="m_dis",
             )
 
-        ml_hhs = None
-        ml_dis = None
-        if model_hhs in ("random_forest", "gradient_boosting"):
-            ml_hhs = train_ml_model(df, config.HHS_CARE, model_hhs)
-        if model_dis in ("random_forest", "gradient_boosting"):
-            ml_dis = train_ml_model(df, config.DISCHARGED, model_dis)
-
         fc_hhs = run_model_forecast(
-            df, config.HHS_CARE, model_hhs, horizon, ml_bundle=ml_hhs
+            df, config.HHS_CARE, model_hhs, horizon, ml_bundle=None
         )
         fc_dis = run_model_forecast(
-            df, config.DISCHARGED, model_dis, horizon, ml_bundle=ml_dis
+            df, config.DISCHARGED, model_dis, horizon, ml_bundle=None
         )
 
         c1, c2 = st.columns(2)
@@ -334,16 +334,8 @@ def main():
 
     with tab2:
         st.subheader("Scenario comparison (HHS care)")
-        mla = train_ml_model(df, config.HHS_CARE, compare_a) if compare_a in (
-            "random_forest",
-            "gradient_boosting",
-        ) else None
-        mlb = train_ml_model(df, config.HHS_CARE, compare_b) if compare_b in (
-            "random_forest",
-            "gradient_boosting",
-        ) else None
-        fa = run_model_forecast(df, config.HHS_CARE, compare_a, horizon, ml_bundle=mla)
-        fb = run_model_forecast(df, config.HHS_CARE, compare_b, horizon, ml_bundle=mlb)
+        fa = run_model_forecast(df, config.HHS_CARE, compare_a, horizon, ml_bundle=None)
+        fb = run_model_forecast(df, config.HHS_CARE, compare_b, horizon, ml_bundle=None)
 
         figc = go.Figure()
         h = fa.history.tail(365)
@@ -410,55 +402,212 @@ def main():
         st.plotly_chart(fign, use_container_width=True)
 
     with tab4:
-        st.subheader("Walk-forward validation (time-based)")
-        eval_model: ModelName = st.selectbox(
-            "Model to evaluate",
-            list(MODEL_LABELS.keys()),
-            index=2,
-            format_func=lambda k: MODEL_LABELS[k],
-            key="eval_m",
+        st.subheader("Early-warning indicators (non-training)")
+        st.caption(
+            "Rule-based alerts from short-term forecasts to support proactive shelter and staffing decisions."
         )
-        wf = cached_walk_forward(csv_path, config.HHS_CARE, eval_model, data_fingerprint)
-        rows = []
-        for h, m in sorted(wf.items()):
-            rows.append(
-                {
-                    "Horizon (days)": h,
-                    "MAE": round(m["mae"], 2),
-                    "RMSE": round(m["rmse"], 2),
-                    "MAPE %": round(m["mape"], 2),
-                    "n": m["n"],
-                }
-            )
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
-        kpis = kpi_bundle(
-            df,
-            config.HHS_CARE,
-            eval_model,
-            breach_level=float(breach_level),
-            walk_forward=wf,
-        )
+        w1, w2 = st.columns(2)
+        with w1:
+            warning_model: ModelName = st.selectbox(
+                "Warning forecast model",
+                list(MODEL_LABELS.keys()),
+                index=2,
+                format_func=lambda k: MODEL_LABELS[k],
+                key="warn_model",
+            )
+        with w2:
+            breach_level = st.number_input(
+                "Capacity stress threshold (HHS care count)",
+                min_value=0,
+                value=int(2600),
+                step=50,
+                key="warn_breach_threshold",
+            )
+
+        fc_hhs_warn = run_model_forecast(df, config.HHS_CARE, warning_model, horizon, ml_bundle=None)
+        fc_dis_warn = run_model_forecast(df, config.DISCHARGED, warning_model, horizon, ml_bundle=None)
+
+        hhs_fc = pd.Series(fc_hhs_warn.point, index=fc_hhs_warn.forecast_index, name="hhs_care_fc")
+        dis_fc = pd.Series(fc_dis_warn.point, index=fc_dis_warn.forecast_index, name="discharge_fc")
+        transfer_assumption = float(df[config.TRANSFERS].iloc[-1])
+        net_pressure_fc = transfer_assumption - dis_fc
+
+        above = hhs_fc[hhs_fc > float(breach_level)]
+        breach_prob_14d = float((hhs_fc > float(breach_level)).mean())
+        days_to_breach = int((above.index[0] - hhs_fc.index[0]).days + 1) if not above.empty else None
+        net_inflow_share = float((net_pressure_fc > 0).mean())
+
         k1, k2, k3, k4 = st.columns(4)
-        acc = kpis["forecast_accuracy_pct"]
         k1.metric(
-            "Forecast accuracy (%)",
-            f"{acc:.1f}" if acc is not None and not (isinstance(acc, float) and np.isnan(acc)) else "—",
+            "Breach risk (horizon)",
+            f"{100 * breach_prob_14d:.1f}%",
+            help="Share of forecast days above the capacity threshold.",
         )
         k2.metric(
-            "Surge lead time (days)",
-            f"{kpis['surge_lead_time_days']}" if kpis["surge_lead_time_days"] is not None else "—",
-            help="Days until SARIMA forecast crosses historical 90th percentile.",
+            "Lead time to breach",
+            f"{days_to_breach} days" if days_to_breach is not None else "No breach in horizon",
+            help="Days until first forecasted threshold crossing.",
         )
         k3.metric(
-            "Breach prob. (14d)",
-            f"{kpis['capacity_breach_prob_14d']:.2f}" if kpis["capacity_breach_prob_14d"] is not None else "—",
+            "Net inflow risk days",
+            f"{100 * net_inflow_share:.1f}%",
+            help="Share of forecast days where transfers exceed discharges.",
         )
         k4.metric(
-            "Stability index",
-            f"{kpis['forecast_stability_index']:.3f}" if kpis["forecast_stability_index"] is not None else "—",
+            "Transfer assumption",
+            f"{transfer_assumption:,.0f}/day",
+            help="Held constant at the latest observed transfers value.",
         )
 
+        warn_df = pd.DataFrame(
+            {
+                "HHS care forecast": hhs_fc.round(1),
+                "Discharge forecast": dis_fc.round(1),
+                "Transfer assumption": transfer_assumption,
+                "Net pressure (transfer - discharge)": net_pressure_fc.round(1),
+                "Capacity breach": (hhs_fc > float(breach_level)),
+            }
+        )
+        st.dataframe(warn_df, use_container_width=True)
+
+    with tab5:
+        st.subheader("ML vs statistical comparison (optional)")
+        st.caption(
+            "This section is isolated from the main flow and trains on the same 720 valid rows currently loaded."
+        )
+        run_ml_compare = st.button(
+            "Run ML comparison now",
+            key="run_ml_compare_btn",
+            help="Runs training and walk-forward metrics only when you click.",
+        )
+        compare_labels = {
+            "naive": "Naïve (last value)",
+            "ma_7": "Moving average (7d)",
+            "sarima": "SARIMA (weekly seasonality)",
+            "ets": "Exponential smoothing (Holt–Winters)",
+            "random_forest": "Random Forest",
+            "gradient_boosting": "Gradient Boosting",
+        }
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            cmp_target = st.selectbox(
+                "Comparison target",
+                [config.HHS_CARE, config.DISCHARGED],
+                index=0,
+                key="cmp_target",
+            )
+        with c2:
+            cmp_a = st.selectbox(
+                "Model A",
+                list(compare_labels.keys()),
+                index=2,
+                format_func=lambda k: compare_labels[k],
+                key="cmp_a",
+            )
+        with c3:
+            cmp_b = st.selectbox(
+                "Model B",
+                list(compare_labels.keys()),
+                index=4,
+                format_func=lambda k: compare_labels[k],
+                key="cmp_b",
+            )
+
+        if not run_ml_compare:
+            st.info("Click **Run ML comparison now** to generate charts and metrics.")
+        else:
+            ml_a = (
+                train_ml_model(df, cmp_target, cmp_a)
+                if cmp_a in ("random_forest", "gradient_boosting")
+                else None
+            )
+            ml_b = (
+                train_ml_model(df, cmp_target, cmp_b)
+                if cmp_b in ("random_forest", "gradient_boosting")
+                else None
+            )
+            fa = run_model_forecast(df, cmp_target, cmp_a, horizon, ml_bundle=ml_a)
+            fb = run_model_forecast(df, cmp_target, cmp_b, horizon, ml_bundle=ml_b)
+
+            figm = go.Figure()
+            h = fa.history.tail(365)
+            figm.add_trace(go.Scatter(x=h.index, y=h.values, name="History", line=dict(color="#64748b")))
+            figm.add_trace(
+                go.Scatter(
+                    x=fa.forecast_index,
+                    y=fa.point,
+                    name=compare_labels[cmp_a],
+                    line=dict(color="#2563eb", dash="dash"),
+                )
+            )
+            figm.add_trace(
+                go.Scatter(
+                    x=fb.forecast_index,
+                    y=fb.point,
+                    name=compare_labels[cmp_b],
+                    line=dict(color="#ea580c", dash="dot"),
+                )
+            )
+            figm.update_layout(height=420, hovermode="x unified", title="Forecast comparison")
+            st.plotly_chart(figm, use_container_width=True)
+
+            s_a = cached_model_scores(csv_path, cmp_target, cmp_a, data_fingerprint)
+            s_b = cached_model_scores(csv_path, cmp_target, cmp_b, data_fingerprint)
+            rows = []
+            for h_ in (1, 7, 14):
+                ma = s_a.get(h_, {})
+                mb = s_b.get(h_, {})
+                rows.append(
+                    {
+                        "Horizon (days)": h_,
+                        "A model": compare_labels[cmp_a],
+                        "A MAE": round(ma.get("mae", np.nan), 2),
+                        "A RMSE": round(ma.get("rmse", np.nan), 2),
+                        "A MAPE %": round(ma.get("mape", np.nan), 2),
+                        "B model": compare_labels[cmp_b],
+                        "B MAE": round(mb.get("mae", np.nan), 2),
+                        "B RMSE": round(mb.get("rmse", np.nan), 2),
+                        "B MAPE %": round(mb.get("mape", np.nan), 2),
+                    }
+                )
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    with tab6:
+        st.subheader("Methodology mode")
+        st.caption("Separate section to control and explain time-series preparation behavior.")
+        i1, i2 = st.columns(2)
+        i1.metric("Current mode", prep_mode)
+        i2.metric("Modeling rows in this mode", f"{modeled_days:,}")
+        st.markdown("#### Dataset used in this mode")
+        data_dict = pd.DataFrame(
+            [
+                {"Column": "Date", "Description": "Reporting date"},
+                {
+                    "Column": "Children apprehended and placed in CBP custody*",
+                    "Description": "Daily intake volume",
+                },
+                {"Column": "Children in CBP custody", "Description": "Active CBP care load"},
+                {
+                    "Column": "Children transferred out of CBP custody",
+                    "Description": "Flow into HHS system",
+                },
+                {"Column": "Children in HHS Care", "Description": "Active HHS care load"},
+                {
+                    "Column": "Children discharged from HHS Care",
+                    "Description": "Successful sponsor placements",
+                },
+            ]
+        )
+        st.dataframe(data_dict, use_container_width=True)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("CSV file", CSV_DEFAULT.name)
+        c2.metric("Valid dated rows", f"{valid_dated_rows:,}")
+        c3.metric("Rows after selected mode", f"{modeled_days:,}")
+        st.markdown(
+            "- **Raw valid rows (no interpolation):** uses only cleaned dated observations from the CSV.\n"
+            "- **Continuous daily + interpolation:** reindexes to daily calendar continuity and interpolates missing days."
+        )
 
 if __name__ == "__main__":
     main()

@@ -121,9 +121,30 @@ def _fit_sklearn_regressor(name: str):
     return GradientBoostingRegressor(random_state=42, max_depth=4, n_estimators=150, learning_rate=0.08)
 
 
+def _prepare_ml_features(
+    X: pd.DataFrame,
+    reference_columns: list[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Coerce features to numeric for sklearn models.
+    Unknown/non-numeric values become NaN and are imputed with 0.
+    """
+    out = X.copy()
+    if reference_columns is not None:
+        out = out.reindex(columns=reference_columns, fill_value=np.nan)
+    out = out.apply(pd.to_numeric, errors="coerce")
+    out = out.ffill().bfill().fillna(0.0)
+    if reference_columns is None:
+        all_nan_cols = out.columns[out.isna().all()].tolist()
+        if all_nan_cols:
+            out = out.drop(columns=all_nan_cols)
+    return out
+
+
 def train_ml_model(df_daily: pd.DataFrame, target_col: str, model_name: str):
     sup = build_supervised_frame(df_daily, target_col)
     X, y = make_xy_next_day(sup, target_col)
+    X = _prepare_ml_features(X)
     feature_columns = X.columns.tolist()
     reg = _fit_sklearn_regressor(model_name)
     reg.fit(X, y)
@@ -136,7 +157,8 @@ def _row_features_at_end(
     feature_columns: list[str],
 ) -> pd.DataFrame:
     sup = build_supervised_frame(df_block, target_col)
-    last = sup.iloc[[-1]].reindex(columns=feature_columns)
+    last = sup.iloc[[-1]]
+    last = _prepare_ml_features(last, reference_columns=feature_columns)
     if last.isna().any().any() and len(sup) >= 2:
         last = last.fillna(sup.iloc[-2])
     return last
@@ -163,6 +185,7 @@ def ml_recursive_forecast(
         row = _row_features_at_end(block, target_col, feature_columns)
         if row.isna().any().any():
             row = row.ffill(axis=1).bfill(axis=1)
+        row = _prepare_ml_features(row, reference_columns=feature_columns)
         y_hat = float(model.predict(row.values)[0])
         preds.append(y_hat)
         next_idx = block.index[-1] + pd.Timedelta(days=1)

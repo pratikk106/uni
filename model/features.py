@@ -13,7 +13,16 @@ def build_supervised_frame(
     roll_windows: tuple[int, ...] = (7, 14),
 ) -> pd.DataFrame:
     """Row-level features for sklearn models; target is same-day value (use shifted target externally)."""
-    d = df.copy()
+    # Keep only modeling-relevant columns so training does not use every raw column.
+    keep_cols = [target_col]
+    exog = [
+        config.APPREHENDED,
+        config.CBP_CUSTODY,
+        config.TRANSFERS,
+        config.DISCHARGED,
+    ]
+    keep_cols.extend([c for c in exog if c in df.columns and c != target_col])
+    d = df[keep_cols].copy()
     for lag in lags:
         d[f"lag_{lag}"] = d[target_col].shift(lag)
     for w in roll_windows:
@@ -25,12 +34,6 @@ def build_supervised_frame(
         d[f"net_pressure_lag_{lag}"] = np_.shift(lag)
     d["dow"] = d.index.dayofweek
     d["month"] = d.index.month
-    exog = [
-        config.APPREHENDED,
-        config.CBP_CUSTODY,
-        config.TRANSFERS,
-        config.DISCHARGED,
-    ]
     for c in exog:
         if c in d.columns:
             d[f"{c}_lag1"] = d[c].shift(1)
